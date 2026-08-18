@@ -11,6 +11,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.cosmic.ide.dependency.resolver.api.Artifact
 import org.cosmic.ide.dependency.resolver.api.EventReciever
+import org.cosmic.ide.dependency.resolver.api.Repository // <--- إضافة هذا الاستيراد
 import org.cosmic.ide.dependency.resolver.eventReciever
 import org.cosmic.ide.dependency.resolver.getArtifact
 import org.cosmic.ide.dependency.resolver.repositories
@@ -40,9 +41,9 @@ class DependencyResolver(
     private val buildSettings: BuildSettings?
 ) {
     companion object {
-        private const val MAX_CHUNK_SIZE_BYTES = 9 * 1024 * 1024L  // الحد الأقصى للجزء: 9 ميجابايت
-        private const val MIN_CHUNK_SIZE_BYTES = 2 * 1024 * 1024L  // حد الجزء الأخير للدمج: 2 ميجابايت
-        private const val MAX_JAR_SIZE_BYTES = 12 * 1024 * 1024L   // 12 MB حد الحجم للتحقق الأولي قبل التقسيم
+        private const val MAX_CHUNK_SIZE_BYTES = 9 * 1024 * 1024L
+        private const val MIN_CHUNK_SIZE_BYTES = 2 * 1024 * 1024L
+        private const val MAX_JAR_SIZE_BYTES = 12 * 1024 * 1024L
 
         private val DEFAULT_REPOS = """
           |[
@@ -606,9 +607,6 @@ class DependencyResolver(
     private fun parseMajorVersion(version: String): Int =
         version.trimStart().split(".", "-").firstOrNull()?.toIntOrNull() ?: 0
 
-    /**
-     * Splits large JAR files based on size (9 MB chunks) and merges last chunk if <= 2 MB.
-     */
     private fun splitJarFile(jarFile: File): List<File> {
         val splitJars = mutableListOf<File>()
         if (!jarFile.exists()) return splitJars
@@ -617,7 +615,6 @@ class DependencyResolver(
             return splitJars
         }
 
-        // قراءة وتفكيك كل المحتويات إلى الذاكرة
         val classEntries = mutableListOf<Pair<String, ByteArray>>()
         val resourceEntries = mutableListOf<Pair<String, ByteArray>>()
         val addedClassNames = mutableSetOf<String>()
@@ -639,7 +636,6 @@ class DependencyResolver(
             }
         }
 
-        // تقسيم الكلاسات بناءً على الحجم الكلي الفعلي (9MB max)
         val chunks = mutableListOf<MutableList<Pair<String, ByteArray>>>()
         var currentChunk = mutableListOf<Pair<String, ByteArray>>()
         var currentChunkSize = 0L
@@ -658,7 +654,6 @@ class DependencyResolver(
             chunks.add(currentChunk)
         }
 
-        // فحص الجزء الأخير: إذا كان حجم الكلاسات الفعلي فيه <= 2MB وهناك أجزاء سابقة، يتم دمجها مع الجزء السابق
         if (chunks.size > 1) {
             val lastChunk = chunks.last()
             val lastChunkTotalBytes = lastChunk.sumOf { it.second.size.toLong() }
@@ -670,20 +665,17 @@ class DependencyResolver(
             }
         }
 
-        // كتابة الملفات المقسمة على الهاردسك
         chunks.forEachIndexed { index, chunkClasses ->
             val partIndex = index + 1
             val chunkFile = File(jarFile.parentFile, "split_${partIndex}_${jarFile.name}")
 
             ZipOutputStream(FileOutputStream(chunkFile)).use { zos ->
-                // إضافة الكلاسات المقسمة لهذا الجزء
                 for ((name, bytes) in chunkClasses) {
                     zos.putNextEntry(ZipEntry(name))
                     zos.write(bytes)
                     zos.closeEntry()
                 }
 
-                // تضمين الموارد الخاصة بالأجزاء المتبقية (non-class) داخل الجزء الأول فقط
                 if (partIndex == 1) {
                     for ((name, bytes) in resourceEntries) {
                         zos.putNextEntry(ZipEntry(name))
@@ -698,13 +690,10 @@ class DependencyResolver(
         return if (splitJars.isEmpty()) listOf(jarFile) else splitJars
     }
 
-    /**
-     * Creates a GlobalSyntheticsConsumer to capture synthetic items emitted by D8.
-     */
     private fun createGlobalSyntheticsConsumer(outputDir: File): GlobalSyntheticsConsumer {
-        return GlobalSyntheticsConsumer { globalSynthetic ->
+        return GlobalSyntheticsConsumer { globalSynthetic, _, _ -> // <--- تعديل التوقيع لثلاث معاملات
             try {
-                val bytes = globalSynthetic.getBytes()
+                val bytes = globalSynthetic.bytes // <--- استخدام الخاصية الفعلية بدلاً من getBytes()
                 val synthFile = File(outputDir, "synthetic_${System.currentTimeMillis()}_${globalSynthetic.hashCode()}.dex")
                 FileOutputStream(synthFile).use { fos ->
                     fos.write(bytes)
@@ -714,9 +703,6 @@ class DependencyResolver(
         }
     }
 
-    /**
-     * Cleans up synthetic files produced during D8 compilation.
-     */
     private fun cleanupSyntheticFiles(targetDir: File) {
         runCatching {
             targetDir.listFiles()?.forEach { file ->
@@ -727,9 +713,6 @@ class DependencyResolver(
         }
     }
 
-    /**
-     * Compiles JAR to DEX using D8, handling large JAR splitting and GlobalSynthetics collection.
-     */
     private fun compileJarWithFallback(jarFile: Path, jars: List<Path>, libraryJars: List<Path>) {
         Files.createDirectories(jarFile.parent)
         val minApi = buildSettings?.minSdkVersion ?: 26
@@ -744,7 +727,6 @@ class DependencyResolver(
                 val combinedClasspath = (jars + otherChunksAsClasspath).distinct()
 
                 try {
-                    // Fast path: Minimal classpath + GlobalSyntheticsConsumer
                     val builder = D8Command.builder()
                         .setIntermediate(true)
                         .setMode(CompilationMode.RELEASE)
@@ -756,7 +738,6 @@ class DependencyResolver(
 
                     D8.run(builder.build())
                 } catch (_: Throwable) {
-                    // Fallback: Full classpath + GlobalSyntheticsConsumer
                     System.gc()
                     val builder = D8Command.builder()
                         .setIntermediate(true)
@@ -772,13 +753,11 @@ class DependencyResolver(
                 }
             }
         } finally {
-            // Clean up temporary split files
             jarChunks.forEach { chunk ->
                 if (chunk != jarFile && Files.exists(chunk)) {
                     runCatching { Files.delete(chunk) }
                 }
             }
-            // Clean up synthetic files after compilation completion
             cleanupSyntheticFiles(targetDir)
             System.gc()
         }
