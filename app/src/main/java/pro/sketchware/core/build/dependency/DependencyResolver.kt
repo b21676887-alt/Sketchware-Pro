@@ -6,6 +6,7 @@ import com.android.tools.r8.D8Command
 import com.android.tools.r8.GlobalSyntheticsConsumer
 import com.android.tools.r8.OutputMode
 import com.google.gson.Gson
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -41,6 +42,7 @@ class DependencyResolver(
     private val buildSettings: BuildSettings?
 ) {
     companion object {
+        private val syntheticCounter = AtomicInteger(0)
         private const val MAX_CHUNK_SIZE_BYTES = 9 * 1024 * 1024L
         private const val MIN_CHUNK_SIZE_BYTES = 2 * 1024 * 1024L
         private const val MAX_JAR_SIZE_BYTES = 12 * 1024 * 1024L
