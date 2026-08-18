@@ -3,27 +3,32 @@ package pro.sketchware.core.build.dependency
 import com.android.tools.r8.CompilationMode
 import com.android.tools.r8.D8
 import com.android.tools.r8.D8Command
+import com.android.tools.r8.GlobalSyntheticsConsumer
 import com.android.tools.r8.OutputMode
 import com.google.gson.Gson
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import pro.sketchware.core.build.BuildSettings
-import pro.sketchware.util.Helper
-import pro.sketchware.util.library.BuiltInLibraries
 import org.cosmic.ide.dependency.resolver.api.Artifact
 import org.cosmic.ide.dependency.resolver.api.EventReciever
-import org.cosmic.ide.dependency.resolver.api.Repository
 import org.cosmic.ide.dependency.resolver.eventReciever
 import org.cosmic.ide.dependency.resolver.getArtifact
 import org.cosmic.ide.dependency.resolver.repositories
+import pro.sketchware.core.build.BuildSettings
 import pro.sketchware.core.project.SketchwarePaths
+import pro.sketchware.util.Helper
+import pro.sketchware.util.library.BuiltInLibraries
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
-import kotlinx.coroutines.TimeoutCancellationException
 import java.util.regex.Pattern
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
 
@@ -35,6 +40,10 @@ class DependencyResolver(
     private val buildSettings: BuildSettings?
 ) {
     companion object {
+        private const val MAX_CHUNK_SIZE_BYTES = 9 * 1024 * 1024L  // الحد الأقصى للجزء: 9 ميجابايت
+        private const val MIN_CHUNK_SIZE_BYTES = 2 * 1024 * 1024L  // حد الجزء الأخير للدمج: 2 ميجابايت
+        private const val MAX_JAR_SIZE_BYTES = 12 * 1024 * 1024L   // 12 MB حد الحجم للتحقق الأولي قبل التقسيم
+
         private val DEFAULT_REPOS = """
           |[
           |    {"url": "https://repo.hortonworks.com/content/repositories/releases", "name": "HortanWorks"},
@@ -47,8 +56,6 @@ class DependencyResolver(
           |]
         """.trimMargin()
 
-        /** Specific androidx groupIds that are bundled in BuiltInLibraries.
-         *  Non-built-in groups (media3, camera, compose, navigation, paging, etc.) are NOT listed. */
         private val BUILT_IN_ANDROIDX_GROUPS = setOf(
             "androidx.activity",
             "androidx.annotation",
@@ -113,10 +120,6 @@ class DependencyResolver(
         downloadPath = SketchwarePaths.getLocalLibsFallbackDir().absolutePath
     }
 
-    /**
-     * Checks if a library file exists in either primary or fallback path.
-     * Returns the existing file, or null if not found in either location.
-     */
     private fun resolveExistingLibFile(artifactId: String, version: String, filename: String): File? {
         val primary = File(SketchwarePaths.getLocalLibsDir(), "$artifactId-v$version/$filename")
         if (primary.exists() && primary.length() > 0) return primary
@@ -132,7 +135,6 @@ class DependencyResolver(
             Files.createDirectories(repositoriesJson.parent)
             repositoriesJson.writeText(DEFAULT_REPOS)
         }
-        // Remove previously added custom repos to prevent infinite growth on repeated instantiation
         repositories.removeAll { repo ->
             repo !is org.cosmic.ide.dependency.resolver.repository.MavenCentral &&
             repo !is org.cosmic.ide.dependency.resolver.repository.GoogleMaven &&
@@ -211,7 +213,6 @@ class DependencyResolver(
             dependencyClasspath.add(Paths.get(it))
         }
 
-        // For AAR, check classes.jar (the unzip product) since classes.aar gets deleted after extraction
         val mainCacheCheckFile = if (dependency.extension == "aar") "classes.jar" else "classes.${dependency.extension}"
         val existingMainFile = resolveExistingLibFile(dependency.artifactId, dependency.version, mainCacheCheckFile)
         val mainCached = existingMainFile != null
@@ -223,7 +224,6 @@ class DependencyResolver(
                 )
             } catch (e: Exception) {
                 if (isStoragePermissionError(e) && downloadPath == SketchwarePaths.getLocalLibsDir().absolutePath) {
-                    // Primary path blocked by FUSE, retry with app-specific fallback
                     switchToFallbackPath()
                     try {
                         dependency.downloadTo(
@@ -318,7 +318,6 @@ class DependencyResolver(
                     dependency.getAllDependencies()
                 }
             } catch (e: TimeoutCancellationException) {
-                // Timed out resolving transitive deps; notify UI and complete with just the main library
                 callback.onResolutionTimeout(dependency)
                 callback.onTaskCompleted(listOf("${dependency.artifactId}-v${dependency.version}"))
                 return@runBlocking
@@ -326,8 +325,6 @@ class DependencyResolver(
                 callback.onDependenciesNotFound(dependency)
                 return@runBlocking
             }
-            // Note: dependency tree cache is saved after processedDeps is populated below,
-            // so only actually-downloaded (non-built-in) deps are recorded.
         }
 
         val processedDeps = mutableListOf<Artifact>()
@@ -356,7 +353,6 @@ class DependencyResolver(
                 "classes.${dep.extension}"
             )
 
-            // For AAR, check classes.jar (the unzip product) since classes.aar gets deleted after extraction
             val depCacheCheckFile = if (dep.extension == "aar") "classes.jar" else "classes.${dep.extension}"
             val existingDepFile = resolveExistingLibFile(dep.artifactId, dep.version, depCacheCheckFile)
             val depCached = existingDepFile != null
@@ -401,7 +397,6 @@ class DependencyResolver(
             }
 
             val depJar = if (existingDepFile != null) {
-                // Use the actual location (may be in fallback path)
                 existingDepFile.parentFile!!.resolve("classes.jar").toPath()
             } else if (dep.extension == "jar") {
                 path
@@ -417,8 +412,6 @@ class DependencyResolver(
             processedDeps.add(dep)
         }
 
-        // Save ALL resolved deps (including built-in) so the UI can display the full dependency tree.
-        // Built-in deps are flagged so smart deletion knows not to delete their (non-existent) folders.
         if (cachedDeps == null) {
             saveDependencyTreeCache(dependency, allDeps, builtInKeys)
         }
@@ -503,8 +496,6 @@ class DependencyResolver(
             val cacheFile = Paths.get(downloadPath, "${mainDep.artifactId}-v${mainDep.version}", "dependency-tree.json")
             Files.createDirectories(cacheFile.parent)
 
-            // Walk the actual dependency tree (BFS) to record depth + parent for tree visualization.
-            // Falls back to flat list if tree structure is unavailable (e.g. dependencies not resolved).
             val entries = mutableListOf<HashMap<String, Any?>>()
             val visited = mutableSetOf<String>()
             val mainCoord = "${mainDep.groupId}:${mainDep.artifactId}:${mainDep.version}"
@@ -512,7 +503,6 @@ class DependencyResolver(
             data class QueueEntry(val artifact: Artifact, val parentCoord: String, val depth: Int)
             val queue = ArrayDeque<QueueEntry>()
 
-            // Seed with direct deps of the root artifact
             val directDeps = mainDep.dependencies
             if (directDeps != null && directDeps.isNotEmpty()) {
                 directDeps.forEach { dep -> queue.add(QueueEntry(dep, mainCoord, 1)) }
@@ -542,7 +532,6 @@ class DependencyResolver(
                     }
                 }
             } else {
-                // Fallback: tree structure unavailable, save as flat list (depth 1, no parent)
                 deps.forEach { dep ->
                     val key = "${dep.groupId}:${dep.artifactId}:${dep.version}"
                     entries.add(hashMapOf(
@@ -560,7 +549,6 @@ class DependencyResolver(
             }
             cacheFile.writeText(Gson().toJson(entries))
         } catch (_: Exception) {
-            // Cache write failure is non-fatal
         }
     }
 
@@ -593,84 +581,205 @@ class DependencyResolver(
     }
 
     private fun isBuiltInDependency(groupId: String, artifactId: String, version: String): Boolean {
-        // Skip transitive deps that are already bundled as BuiltInLibraries.
-        // This reduces unnecessary downloads, dex compilations, and DEX merge memory during build.
-        // Even without skipping, DexMerger's KEEP_FIRST means the built-in wins unpredictably;
-        // skipping makes that behavior deterministic.
-        //
-        // For libraries with breaking API changes between major versions (e.g. OkHttp 4→5),
-        // we only skip if the built-in major version >= the required major version.
-        // For all other groups the built-in versions are backward-compatible across minor versions.
-
-        // Only skip specific androidx groups that are actually bundled in BuiltInLibraries.
-        // Non-built-in androidx libs (media3, camera, compose, navigation, etc.) must NOT be skipped.
         if (groupId.startsWith("androidx.") && groupId in BUILT_IN_ANDROIDX_GROUPS) return true
         if (groupId == "com.google.firebase") return true
         if (groupId.startsWith("com.google.android.gms")) return true
         if (groupId.startsWith("com.google.android.datatransport")) return true
         if (groupId == "com.google.android.material") return true
         if (groupId == "com.google.android.play") return true
-        if (groupId == "com.google.android.recaptcha") return true
-        if (groupId == "com.google.android.ump") return true
-        if (groupId.startsWith("org.jetbrains.kotlin")) return true  // Kotlin guarantees binary compat
+        if (groupId.startsWith("org.jetbrains.kotlin")) return true
         if (groupId == "org.jetbrains") return true
-        if (groupId == "org.jspecify") return true
         if (groupId == "com.google.code.gson") return true
-        if (groupId == "com.google.errorprone") return true
-        if (groupId == "com.google.auto.value") return true
         if (groupId == "com.github.bumptech.glide") return true
         if (groupId == "com.airbnb.android" && artifactId == "lottie") return true
-        if (groupId == "com.pierfrancescosoffritti.androidyoutubeplayer") return true
-        if (groupId == "de.hdodenhof" && artifactId == "circleimageview") return true
-        if (groupId == "com.andrognito" && artifactId == "patternlockview") return true
-        if (groupId == "br.tiagohm.codeview") return true
-        if (groupId == "affan.ahmad.otp") return true
-        if (groupId == "com.sayuti") return true
 
-        // Version-aware check for libraries with known breaking changes between major versions.
-        // Skip only if the built-in major version >= required major version.
         if (groupId == "com.squareup.okhttp3") {
-            // Built-in: okhttp-android-5.1.0 (major 5). OkHttp 4→5 removed some APIs.
             return parseMajorVersion(version) <= 5
         }
         if (groupId == "com.squareup.okio") {
-            // Built-in: okio-jvm-3.15.0 (major 3). Okio 2→3 removed some APIs.
             return parseMajorVersion(version) <= 3
         }
 
         return false
     }
 
-    /** Extracts the leading integer major version from a version string, e.g. "4.12.0" → 4. */
     private fun parseMajorVersion(version: String): Int =
         version.trimStart().split(".", "-").firstOrNull()?.toIntOrNull() ?: 0
 
     /**
-     * Compiles a JAR to DEX using D8, trying without classpath first to minimize memory usage.
-     * If the minimal-classpath attempt fails (e.g. desugaring needs type info from dependencies),
-     * retries with full classpath. This reduces D8 memory from O(N) to O(1) for most libraries.
+     * Splits large JAR files based on size (9 MB chunks) and merges last chunk if <= 2 MB.
+     */
+    private fun splitJarFile(jarFile: File): List<File> {
+        val splitJars = mutableListOf<File>()
+        if (!jarFile.exists()) return splitJars
+        if (jarFile.length() <= MAX_JAR_SIZE_BYTES) {
+            splitJars.add(jarFile)
+            return splitJars
+        }
+
+        // قراءة وتفكيك كل المحتويات إلى الذاكرة
+        val classEntries = mutableListOf<Pair<String, ByteArray>>()
+        val resourceEntries = mutableListOf<Pair<String, ByteArray>>()
+        val addedClassNames = mutableSetOf<String>()
+
+        ZipInputStream(FileInputStream(jarFile)).use { zis ->
+            var entry: ZipEntry? = zis.nextEntry
+            while (entry != null) {
+                if (!entry.isDirectory) {
+                    val bytes = zis.readBytes()
+                    if (entry.name.endsWith(".class")) {
+                        if (addedClassNames.add(entry.name)) {
+                            classEntries.add(entry.name to bytes)
+                        }
+                    } else {
+                        resourceEntries.add(entry.name to bytes)
+                    }
+                }
+                entry = zis.nextEntry
+            }
+        }
+
+        // تقسيم الكلاسات بناءً على الحجم الكلي الفعلي (9MB max)
+        val chunks = mutableListOf<MutableList<Pair<String, ByteArray>>>()
+        var currentChunk = mutableListOf<Pair<String, ByteArray>>()
+        var currentChunkSize = 0L
+
+        for (item in classEntries) {
+            val itemSize = item.second.size.toLong()
+            if (currentChunk.isNotEmpty() && (currentChunkSize + itemSize > MAX_CHUNK_SIZE_BYTES)) {
+                chunks.add(currentChunk)
+                currentChunk = mutableListOf()
+                currentChunkSize = 0L
+            }
+            currentChunk.add(item)
+            currentChunkSize += itemSize
+        }
+        if (currentChunk.isNotEmpty()) {
+            chunks.add(currentChunk)
+        }
+
+        // فحص الجزء الأخير: إذا كان حجم الكلاسات الفعلي فيه <= 2MB وهناك أجزاء سابقة، يتم دمجها مع الجزء السابق
+        if (chunks.size > 1) {
+            val lastChunk = chunks.last()
+            val lastChunkTotalBytes = lastChunk.sumOf { it.second.size.toLong() }
+
+            if (lastChunkTotalBytes <= MIN_CHUNK_SIZE_BYTES) {
+                val previousChunk = chunks[chunks.size - 2]
+                previousChunk.addAll(lastChunk)
+                chunks.removeAt(chunks.size - 1)
+            }
+        }
+
+        // كتابة الملفات المقسمة على الهاردسك
+        chunks.forEachIndexed { index, chunkClasses ->
+            val partIndex = index + 1
+            val chunkFile = File(jarFile.parentFile, "split_${partIndex}_${jarFile.name}")
+
+            ZipOutputStream(FileOutputStream(chunkFile)).use { zos ->
+                // إضافة الكلاسات المقسمة لهذا الجزء
+                for ((name, bytes) in chunkClasses) {
+                    zos.putNextEntry(ZipEntry(name))
+                    zos.write(bytes)
+                    zos.closeEntry()
+                }
+
+                // تضمين الموارد الخاصة بالأجزاء المتبقية (non-class) داخل الجزء الأول فقط
+                if (partIndex == 1) {
+                    for ((name, bytes) in resourceEntries) {
+                        zos.putNextEntry(ZipEntry(name))
+                        zos.write(bytes)
+                        zos.closeEntry()
+                    }
+                }
+            }
+            splitJars.add(chunkFile)
+        }
+
+        return if (splitJars.isEmpty()) listOf(jarFile) else splitJars
+    }
+
+    /**
+     * Creates a GlobalSyntheticsConsumer to capture synthetic items emitted by D8.
+     */
+    private fun createGlobalSyntheticsConsumer(outputDir: File): GlobalSyntheticsConsumer {
+        return GlobalSyntheticsConsumer { globalSynthetic ->
+            try {
+                val bytes = globalSynthetic.getBytes()
+                val synthFile = File(outputDir, "synthetic_${System.currentTimeMillis()}_${globalSynthetic.hashCode()}.dex")
+                FileOutputStream(synthFile).use { fos ->
+                    fos.write(bytes)
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Cleans up synthetic files produced during D8 compilation.
+     */
+    private fun cleanupSyntheticFiles(targetDir: File) {
+        runCatching {
+            targetDir.listFiles()?.forEach { file ->
+                if (file.isFile && (file.name.startsWith("synthetic_") || file.name.endsWith(".synthetic"))) {
+                    file.delete()
+                }
+            }
+        }
+    }
+
+    /**
+     * Compiles JAR to DEX using D8, handling large JAR splitting and GlobalSynthetics collection.
      */
     private fun compileJarWithFallback(jarFile: Path, jars: List<Path>, libraryJars: List<Path>) {
         Files.createDirectories(jarFile.parent)
         val minApi = buildSettings?.minSdkVersion ?: 26
+        val targetDir = jarFile.parent.toFile()
+
+        val jarChunks = splitJarFile(jarFile.toFile()).map { it.toPath() }
+        val syntheticsConsumer = createGlobalSyntheticsConsumer(targetDir)
+
         try {
-            // Fast path: no classpath, minimal memory
-            D8.run(
-                D8Command.builder().setIntermediate(true).setMode(CompilationMode.RELEASE)
-                    .setMinApiLevel(minApi)
-                    .addProgramFiles(jarFile).addLibraryFiles(libraryJars)
-                    .setOutput(jarFile.parent, OutputMode.DexIndexed).build()
-            )
-        } catch (_: Throwable) {
-            // Fallback: full classpath for desugaring
-            System.gc()
-            D8.run(
-                D8Command.builder().setIntermediate(true).setMode(CompilationMode.RELEASE)
-                    .setMinApiLevel(minApi)
-                    .addProgramFiles(jarFile).addLibraryFiles(libraryJars).addClasspathFiles(jars)
-                    .setOutput(jarFile.parent, OutputMode.DexIndexed).build()
-            )
+            jarChunks.forEach { chunk ->
+                val otherChunksAsClasspath = jarChunks.filter { it != chunk }
+                val combinedClasspath = (jars + otherChunksAsClasspath).distinct()
+
+                try {
+                    // Fast path: Minimal classpath + GlobalSyntheticsConsumer
+                    val builder = D8Command.builder()
+                        .setIntermediate(true)
+                        .setMode(CompilationMode.RELEASE)
+                        .setMinApiLevel(minApi)
+                        .addProgramFiles(chunk)
+                        .addLibraryFiles(libraryJars)
+                        .setGlobalSyntheticsConsumer(syntheticsConsumer)
+                        .setOutput(jarFile.parent, OutputMode.DexIndexed)
+
+                    D8.run(builder.build())
+                } catch (_: Throwable) {
+                    // Fallback: Full classpath + GlobalSyntheticsConsumer
+                    System.gc()
+                    val builder = D8Command.builder()
+                        .setIntermediate(true)
+                        .setMode(CompilationMode.RELEASE)
+                        .setMinApiLevel(minApi)
+                        .addProgramFiles(chunk)
+                        .addLibraryFiles(libraryJars)
+                        .addClasspathFiles(combinedClasspath)
+                        .setGlobalSyntheticsConsumer(syntheticsConsumer)
+                        .setOutput(jarFile.parent, OutputMode.DexIndexed)
+
+                    D8.run(builder.build())
+                }
+            }
         } finally {
+            // Clean up temporary split files
+            jarChunks.forEach { chunk ->
+                if (chunk != jarFile && Files.exists(chunk)) {
+                    runCatching { Files.delete(chunk) }
+                }
+            }
+            // Clean up synthetic files after compilation completion
+            cleanupSyntheticFiles(targetDir)
             System.gc()
         }
     }
