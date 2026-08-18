@@ -691,14 +691,17 @@ class DependencyResolver(
     }
 
     private fun createGlobalSyntheticsConsumer(outputDir: File): GlobalSyntheticsConsumer {
-       return GlobalSyntheticsConsumer { globalSynthetic, _, _ ->
+        return GlobalSyntheticsConsumer { provider, _, _ ->
             try {
-                val synthFile = File(outputDir, "synthetic_${System.currentTimeMillis()}_${globalSynthetic.hashCode()}.dex")
-                FileOutputStream(synthFile).use { fos ->
-                    // قراءة الـ Stream الخاص بالمكون المترجم من R8/D8
-                    globalSynthetic.getByteStream().copyTo(fos)
+                val bytes = provider.buffer
+                if (bytes != null && bytes.isNotEmpty()) {
+                    val synthFile = File(outputDir, "synthetic_${syntheticCounter.incrementAndGet()}.dex")
+                    FileOutputStream(synthFile).use { fos ->
+                        fos.write(bytes, provider.offset, provider.length)
+                    }
                 }
             } catch (_: Exception) {
+                // تجاهل الاستثناءات لتفادي إيقاف التجميع
             }
         }
     }
