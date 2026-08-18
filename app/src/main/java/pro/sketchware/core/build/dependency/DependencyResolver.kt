@@ -727,7 +727,6 @@ class DependencyResolver(
         val jarChunks = splitJarFile(jarFile.toFile()).map { it.toPath() }
         val syntheticsConsumer = createGlobalSyntheticsConsumer(targetDir)
 
-        // إذا كان هناك أكثر من جزء، نقوم بإنشاء مجلد مؤقت لكل جزء تجنباً لقيام D8 بمسح ملفات classes.dex الموالية
         val isChunked = jarChunks.size > 1
 
         try {
@@ -741,40 +740,24 @@ class DependencyResolver(
                     val otherChunksAsClasspath = jarChunks.filter { it != chunk }
                     val combinedClasspath = (jars + otherChunksAsClasspath).distinct()
 
-                    try {
-                        val builder = D8Command.builder()
-                            .setIntermediate(true)
-                            .setMode(CompilationMode.RELEASE)
-                            .setMinApiLevel(minApi)
-                            .addProgramFiles(chunk)
-                            .addLibraryFiles(libraryJars)
-                            .setGlobalSyntheticsConsumer(syntheticsConsumer)
-                            .setOutput(tempChunkDir.toPath(), OutputMode.DexIndexed)
+                    val builder = D8Command.builder()
+                        .setIntermediate(true)
+                        .setMode(CompilationMode.RELEASE)
+                        .setMinApiLevel(minApi)
+                        .addProgramFiles(chunk)
+                        .addLibraryFiles(libraryJars)
+                        .addClasspathFiles(combinedClasspath)
+                        .setGlobalSyntheticsConsumer(syntheticsConsumer)
+                        .setOutput(tempChunkDir.toPath(), OutputMode.DexIndexed)
 
-                        D8.run(builder.build())
-                    } catch (_: Throwable) {
-                        System.gc()
-                        val builder = D8Command.builder()
-                            .setIntermediate(true)
-                            .setMode(CompilationMode.RELEASE)
-                            .setMinApiLevel(minApi)
-                            .addProgramFiles(chunk)
-                            .addLibraryFiles(libraryJars)
-                            .addClasspathFiles(combinedClasspath)
-                            .setGlobalSyntheticsConsumer(syntheticsConsumer)
-                            .setOutput(tempChunkDir.toPath(), OutputMode.DexIndexed)
+                    D8.run(builder.build())
 
-                        D8.run(builder.build())
-                    }
-
-                    // جمع ملفات dex المخرجة من المجلد المؤقت
                     tempChunkDir.listFiles { _, name -> name.endsWith(".dex") }?.let { dexes ->
                         dexes.sortBy { it.name }
                         tempDexFiles.addAll(dexes)
                     }
                 }
 
-                // اعادة تسمية ونقل جميع ملفات classes.dex إلى المجلد الرئيسي بترتيب تسلسلي
                 tempDexFiles.forEachIndexed { index, dexFile ->
                     val newName = if (index == 0) "classes.dex" else "classes${index + 1}.dex"
                     val destFile = File(targetDir, newName)
@@ -782,39 +765,23 @@ class DependencyResolver(
                     dexFile.renameTo(destFile)
                 }
 
-                // تنظيف المجلدات المؤقتة
                 for (i in jarChunks.indices) {
                     File(targetDir, "temp_dex_$i").deleteRecursively()
                 }
 
             } else {
-                // تنفيذ اعتيادي لملف واحد دون الحاجة لمجلدات مؤقتة
                 val chunk = jarChunks.first()
-                try {
-                    val builder = D8Command.builder()
-                        .setIntermediate(true)
-                        .setMode(CompilationMode.RELEASE)
-                        .setMinApiLevel(minApi)
-                        .addProgramFiles(chunk)
-                        .addLibraryFiles(libraryJars)
-                        .setGlobalSyntheticsConsumer(syntheticsConsumer)
-                        .setOutput(jarFile.parent, OutputMode.DexIndexed)
+                val builder = D8Command.builder()
+                    .setIntermediate(true)
+                    .setMode(CompilationMode.RELEASE)
+                    .setMinApiLevel(minApi)
+                    .addProgramFiles(chunk)
+                    .addLibraryFiles(libraryJars)
+                    .addClasspathFiles(jars)
+                    .setGlobalSyntheticsConsumer(syntheticsConsumer)
+                    .setOutput(jarFile.parent, OutputMode.DexIndexed)
 
-                    D8.run(builder.build())
-                } catch (_: Throwable) {
-                    System.gc()
-                    val builder = D8Command.builder()
-                        .setIntermediate(true)
-                        .setMode(CompilationMode.RELEASE)
-                        .setMinApiLevel(minApi)
-                        .addProgramFiles(chunk)
-                        .addLibraryFiles(libraryJars)
-                        .addClasspathFiles(jars)
-                        .setGlobalSyntheticsConsumer(syntheticsConsumer)
-                        .setOutput(jarFile.parent, OutputMode.DexIndexed)
-
-                    D8.run(builder.build())
-                }
+                D8.run(builder.build())
             }
         } finally {
             jarChunks.forEach { chunk ->
