@@ -53,12 +53,15 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.stream.Collectors;
 
 import mod.agus.jcoderz.dex.Dex;
@@ -100,23 +103,6 @@ import proguard.ProGuard;
  * resource compilation (AAPT2), Java compilation (ECJ), Kotlin compilation,
  * DEX generation (D8/Dx), DEX merging, ProGuard/R8 shrinking, StringFog
  * obfuscation, APK assembly, zipalign, and signing.
- * <p>
- * The typical build sequence called from the UI is:
- * <ol>
- *   <li>{@link #maybeExtractAapt2()} —extract AAPT2 binary from assets</li>
- *   <li>{@link #buildBuiltInLibraryInformation()} —resolve which built-in libraries are needed</li>
- *   <li>{@link #compileResources()} —AAPT2 compile + link</li>
- *   <li>{@link #generateViewBinding()} —generate ViewBinding Java sources (optional)</li>
- *   <li>{@link #compileJavaCode()} —ECJ incremental compilation</li>
- *   <li>{@link #createDexFilesFromClasses()} —D8/Dx conversion</li>
- *   <li>{@link #getDexFilesReady()} —merge library DEX files</li>
- *   <li>{@link #buildApk()} —assemble unsigned APK</li>
- *   <li>{@link #runZipalign(String, String)} —align the APK</li>
- *   <li>{@link #signDebugApk()} —sign with testkey</li>
- * </ol>
- *
- * @see BuildProgressReceiver
- * @see ProjectFilePaths
  */
 public class ProjectBuilder {
     public static final String TAG = "AppBuilder";
@@ -138,21 +124,9 @@ public class ProjectBuilder {
     /** Set to false by {@link #compileJavaCode()} when incremental build detects no changes. */
     private boolean classFilesChanged = true;
 
-    /**
-     * Timestamp keeping track of when compiling the project's resources started, needed for stats of how long compiling took.
-     */
     private long timestampResourceCompilationStarted;
 
-    /**
-     * Creates a new project builder for the given project.
-     * Initializes build settings, local library manager, ProGuard handler,
-     * project settings, and AAPT2 binary path.
-     *
-     * @param context the Android context
-     * @param projectFilePaths   the project file paths configuration
-     */
     public ProjectBuilder(Context context, ProjectFilePaths projectFilePaths) {
-        /* Detect some bad behaviour of the app */
         StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder()
                 .detectAll()
                 .penaltyLog()
@@ -163,11 +137,8 @@ public class ProjectBuilder {
 
         try {
             PackageInfo info = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
-
             LogUtil.d(TAG, "Running Sketchware Pro " + info.versionName + " (" + info.versionCode + ")");
-
             ApplicationInfo applicationInfo = context.getPackageManager().getApplicationInfo(context.getPackageName(), 0);
-
             long fileSizeInBytes = new File(applicationInfo.sourceDir).length();
             LogUtil.d(TAG, "base.apk's size is " + Formatter.formatFileSize(context, fileSizeInBytes) + " (" + fileSizeInBytes + " B)");
         } catch (PackageManager.NameNotFoundException e) {
@@ -186,29 +157,11 @@ public class ProjectBuilder {
         settings = new ProjectSettings(projectFilePaths.sc_id);
     }
 
-    /**
-     * Creates a new project builder with a progress receiver for UI updates.
-     *
-     * @param progressReceiver the progress receiver to report build steps to
-     * @param context        the Android context
-     * @param projectFilePaths          the project file paths configuration
-     */
     public ProjectBuilder(BuildProgressReceiver progressReceiver, Context context, ProjectFilePaths projectFilePaths) {
         this(context, projectFilePaths);
         this.progressReceiver = progressReceiver;
     }
 
-    /**
-     * Checks if a file on local storage differs from a file in assets, and if so,
-     * replaces the file on local storage with the one in assets.
-     * <p/>
-     * The file size is checked first as a fast path. If sizes match, SHA-256 is
-     * compared to avoid keeping stale extracted build assets with identical size.
-     *
-     * @param fileInAssets The file in assets relative to assets/ in the APK
-     * @param targetFile   The file on local storage
-     * @return If the file in assets has been extracted
-     */
     public static boolean hasFileChanged(String fileInAssets, String targetFile) {
         File compareToFile = new File(targetFile);
         EncryptedFileUtil fileUtil = new EncryptedFileUtil();
@@ -218,9 +171,7 @@ public class ProjectBuilder {
             return false;
         }
 
-        /* Delete the file */
         fileUtil.deleteDirectory(compareToFile);
-        /* Copy the file from assets to local storage */
         fileUtil.copyAssetFile(SketchApplication.getAppContext(), fileInAssets, targetFile);
         return true;
     }
@@ -248,11 +199,6 @@ public class ProjectBuilder {
         return digest.digest();
     }
 
-    /**
-     * Compile resources and log time needed.
-     *
-     * @throws Exception Thrown when anything goes wrong while compiling resources
-     */
     public void compileResources() throws IOException, SimpleException, MissingFileException {
         timestampResourceCompilationStarted = System.currentTimeMillis();
         ResourceCompiler compiler = new ResourceCompiler(
@@ -264,13 +210,6 @@ public class ProjectBuilder {
         LogUtil.d(TAG, "Compiling resources took " + (System.currentTimeMillis() - timestampResourceCompilationStarted) + " ms");
     }
 
-    /**
-     * Generates ViewBinding Java source files for all layout XML files.
-     * Does nothing if ViewBinding is not enabled in project settings.
-     *
-     * @throws IOException  if reading layout files fails
-     * @throws SAXException if parsing layout XML fails
-     */
     public void generateViewBinding() throws IOException, SAXException {
         if (settings.getValue(ProjectSettings.SETTING_ENABLE_VIEWBINDING, ProjectSettings.SETTING_GENERIC_VALUE_FALSE)
                 .equals(ProjectSettings.SETTING_GENERIC_VALUE_FALSE)) {
@@ -284,15 +223,9 @@ public class ProjectBuilder {
                 .collect(Collectors.toList());
 
         ViewBindingBuilder builder = new ViewBindingBuilder(layouts, outputDirectory, projectFilePaths.packageName);
-
         builder.generateBindings();
     }
 
-    /**
-     * Checks whether D8 is selected as the dexer (instead of Dx).
-     *
-     * @return {@code true} if D8 is enabled in build settings
-     */
     public boolean isD8Enabled() {
         return buildSettings.getValue(
                 BuildSettings.SETTING_DEXER,
@@ -300,20 +233,10 @@ public class ProjectBuilder {
         ).equals(BuildSettings.SETTING_DEXER_D8);
     }
 
-    /**
-     * Returns a user-facing status message indicating which dexer is running.
-     *
-     * @return {@code "D8 is running..."} or {@code "Dx is running..."}
-     */
     public String getDxRunningText() {
         return (isD8Enabled() ? "D8" : "Dx") + " is running...";
     }
 
-    /**
-     * Compile Java classes into DEX file(s)
-     *
-     * @throws Exception Thrown if the compiler had any problems compiling
-     */
     public void createDexFilesFromClasses() throws CompilationFailedException, ReflectiveOperationException, IOException {
         FileUtil.makeDir(projectFilePaths.binDirectoryPath + File.separator + "dex");
         if (proguard.isShrinkingEnabled() && proguard.isR8Enabled()) return;
@@ -343,7 +266,7 @@ public class ProjectBuilder {
                 Log.d(TAG, "Skipping Dx: no .class files changed (incremental). Saved ~"
                         + (System.currentTimeMillis() - savedTimeMillis) + " ms");
                 if (progressReceiver != null) {
-                    progressReceiver.onProgress("DEX is up to date (no changes)", 17);
+                    progressReceiver.onProgress("Dx is up to date (no changes)", 17);
                 }
                 return;
             }
@@ -373,61 +296,37 @@ public class ProjectBuilder {
         }
     }
 
-    /**
-     * Builds the full classpath string for Java compilation, including:
-     * android.jar, HTTP legacy (if enabled), MultiDex (if minSdk &lt; 21),
-     * lambda stubs (if Java &gt; 1.7), built-in libraries, local libraries,
-     * user-specified classpath, and project classpath JARs.
-     *
-     * @return colon-separated classpath string
-     */
     public String getClasspath() {
         StringBuilder classpath = new StringBuilder();
 
-        /*
-         * Add ProjectFilePaths#compiledClassesPath (.sketchware/mysc/xxx/bin/classes) if it exists,
-         * since it may already contain compiled Kotlin classes that ECJ should see on the classpath.
-         */
         KotlinCompilerBridge.maybeAddKotlinFilesToClasspath(classpath, projectFilePaths);
-
-        /* Add android.jar */
         classpath.append(androidJarPath);
 
-        /* Add HTTP legacy files if wanted */
         if (!buildSettings.getValue(BuildSettings.SETTING_NO_HTTP_LEGACY, BuildSettings.SETTING_GENERIC_VALUE_FALSE)
                 .equals(BuildSettings.SETTING_GENERIC_VALUE_TRUE)) {
             classpath.append(":").append(BuiltInLibraries.getLibraryClassesJarPathString(BuiltInLibraries.HTTP_LEGACY_ANDROID));
         }
 
-        /* Include MultiDex library if needed */
         if (settings.getMinSdkVersion() < 21) {
             classpath.append(":").append(BuiltInLibraries.getLibraryClassesJarPathString(BuiltInLibraries.ANDROIDX_MULTIDEX));
         }
 
-        /*
-         * Add lambda helper classes
-         * Since all versions above java 7 supports lambdas, this should work
-         */
         if (!buildSettings.getValue(BuildSettings.SETTING_JAVA_VERSION,
                         BuildSettings.SETTING_JAVA_VERSION_1_7)
                 .equals(BuildSettings.SETTING_JAVA_VERSION_1_7)) {
             classpath.append(":").append(new File(BuiltInLibraries.EXTRACTED_COMPILE_ASSETS_PATH, "core-lambda-stubs.jar").getAbsolutePath());
         }
 
-        /* Add used built-in libraries to the classpath */
         for (BuiltInLibrary library : builtInLibraryManager.getLibraries()) {
             classpath.append(":").append(BuiltInLibraries.getLibraryClassesJarPathString(library.getName()));
         }
 
-        /* Add local libraries to the classpath */
         classpath.append(localLibraryManager.getJarLocalLibrary());
 
-        /* Append user's custom classpath */
         if (!buildSettings.getValue(BuildSettings.SETTING_CLASSPATH, "").isEmpty()) {
             classpath.append(":").append(buildSettings.getValue(BuildSettings.SETTING_CLASSPATH, ""));
         }
 
-        /* Add JARs from project's classpath */
         String classpathDirectoryPath = SketchwarePaths.getProjectClasspathPath(projectFilePaths.sc_id) + File.separator;
         ArrayList<String> classpathJarPaths = FileUtil.listFiles(classpathDirectoryPath, "jar");
         classpath.append(":").append(TextUtils.join(":", classpathJarPaths));
@@ -435,9 +334,6 @@ public class ProjectBuilder {
         return classpath.toString();
     }
 
-    /**
-     * @return Similar to {@link ProjectBuilder#getClasspath()}, but doesn't return some local libraries' JARs if ProGuard full mode is enabled
-     */
     public String getProguardClasspath() {
         Set<String> localLibraryJarsWithFullModeOn = new HashSet<>();
 
@@ -464,29 +360,16 @@ public class ProjectBuilder {
             }
         }
 
-        // remove trailing delimiter
         classpath.deleteCharAt(classpath.length() - 1);
-
         return classpath.toString();
     }
 
-    /**
-     * Dexes libraries.
-     *
-     * @return List of result DEX files which were merged or couldn't be merged with others.
-     * @throws Exception Thrown if merging had problems
-     */
     private Collection<File> dexLibraries(File outputDirectory, List<File> dexes) throws IOException {
         int lastDexNumber = 1;
         Collection<File> resultDexFiles = new LinkedList<>();
         LinkedList<Dex> dexObjects = new LinkedList<>();
         Iterator<File> toMergeIterator = dexes.iterator();
 
-        // Use simple integer counters from DEX headers instead of the previous approach
-        // which iterated all FieldId/MethodId/ProtoId objects and used LinkedList.contains().
-        // That approach was O(n²) and never actually deduplicated because FieldId/MethodId/ProtoId
-        // lack equals()/hashCode() (Object reference equality always returned false),
-        // and their internal indices are DEX-specific (not comparable across files).
         int mergedFieldCount;
         int mergedMethodCount;
         int mergedProtoCount;
@@ -558,9 +441,6 @@ public class ProjectBuilder {
         return resultDexFiles;
     }
 
-    /**
-     * Get package names of in-use libraries which have resources, separated by <code>:</code>.
-     */
     public String getLibraryPackageNames() {
         StringBuilder extraPackages = new StringBuilder();
         for (BuiltInLibrary library : builtInLibraryManager.getLibraries()) {
@@ -571,17 +451,6 @@ public class ProjectBuilder {
         return extraPackages + localLibraryManager.getPackageNameLocalLibrary();
     }
 
-    /**
-     * Compiles the project's Java sources using Eclipse JDT (ECJ).
-     * <p>
-     * Uses incremental compilation when possible:
-     * <ul>
-     *   <li>Skips ECJ entirely if no Java files changed and R.java is unchanged.</li>
-     *   <li>Compiles only the changed Activity files when the classpath and R.java are stable.</li>
-     *   <li>Falls back to a full recompile when R.java changed, the classpath changed,
-     *       user-written Java files changed, or no previous {@code .class} cache exists.</li>
-     * </ul>
-     */
     public void compileJavaCode() throws SimpleException, IOException {
         long savedTimeMillis = System.currentTimeMillis();
 
@@ -604,23 +473,9 @@ public class ProjectBuilder {
                 && !classpathChanged
                 && !cacheMigrationRequired;
 
-        Log.d(TAG, "Incremental compile precheck: canIncremental=" + canIncremental
-                + ", classesExist=" + classesExist
-                + ", cacheFileExists=" + cacheFileExists
-                + ", proguardShrinkingEnabled=" + proguardShrinkingEnabled
-                + ", classpathChanged=" + classpathChanged
-                + ", cacheMigrationRequired=" + cacheMigrationRequired
-                + ", classpathHash=" + Integer.toHexString(currentClasspath.hashCode())
-                + ", classpathLength=" + currentClasspath.length());
-
         if (!canIncremental) {
-            Log.d(TAG, "Incremental build not possible, doing full ECJ recompile"
-                    + " (classesExist=" + classesExist
-                    + ", cacheFileExists=" + cacheFileExists
-                    + ", proguardShrinkingEnabled=" + proguardShrinkingEnabled
-                    + ", classpathChanged=" + classpathChanged
-                    + ", cacheMigrationRequired=" + cacheMigrationRequired + ")");
             runEclipseCompiler(collectAllSourcePaths(), currentClasspath, savedTimeMillis);
+            extractAndMergeMetaInf(); // استخراج وتجميع ملفات META-INF
             updateCacheAfterSuccessfulBuild(cache, currentClasspath);
             return;
         }
@@ -647,9 +502,6 @@ public class ProjectBuilder {
             if (generatedSourceDeleted || customSourceDeleted) {
                 deleteOldClassFiles(cachedPath, cache);
                 stalePaths.add(cachedPath);
-                Log.d(TAG, (customSourceDeleted ? "Custom Java source deleted: " : "Generated Java source deleted: ")
-                        + new File(cachedPath).getName()
-                        + " —doing full ECJ recompile to validate remaining references safely");
             }
         }
         for (String p : stalePaths) cache.removeFromCache(p);
@@ -669,26 +521,7 @@ public class ProjectBuilder {
         }
 
         boolean rJavaChanged = cache.isRJavaChanged(projectFilePaths.rJavaDirectoryPath);
-        Log.d(TAG, "Incremental compile checkpoint: rJavaChanged=" + rJavaChanged
-                + ", rJavaDir=" + projectFilePaths.rJavaDirectoryPath);
         if (rJavaChanged || !dirtyCustomJavaFiles.isEmpty() || !stalePaths.isEmpty()) {
-            String appRJavaRelativePath = projectFilePaths.packageNameAsFolders + File.separator + "R.java";
-            boolean appRJavaChanged = cache.isRJavaFileChanged(projectFilePaths.rJavaDirectoryPath, appRJavaRelativePath);
-            ArrayList<String> rJavaChanges = cache.describeRJavaChanges(projectFilePaths.rJavaDirectoryPath, 20);
-            Log.d(TAG, "Incremental compile checkpoint: appRJavaChanged=" + appRJavaChanged
-                    + ", appRJavaPath=" + appRJavaRelativePath);
-            Log.d(TAG, "Incremental compile checkpoint: rJavaChanges=" + rJavaChanges);
-            if (rJavaChanged) {
-                Log.d(TAG, "R.java changed —resource IDs may have been reassigned, doing full ECJ recompile");
-            }
-            if (!dirtyCustomJavaFiles.isEmpty()) {
-                Log.d(TAG, "User custom Java files changed: " + dirtyCustomJavaFiles.size()
-                        + " —doing full ECJ recompile");
-            }
-            if (!stalePaths.isEmpty()) {
-                Log.d(TAG, "Java source set changed: removed " + stalePaths.size()
-                        + " source file(s) —doing full ECJ recompile");
-            }
             for (String dirtyFilePath : dirtyFilePaths) {
                 deleteOldClassFiles(dirtyFilePath, cache);
             }
@@ -696,14 +529,14 @@ public class ProjectBuilder {
                 deleteOldClassFiles(dirtyCustomJavaFile.getAbsolutePath(), cache);
             }
             runEclipseCompiler(collectAllSourcePaths(), currentClasspath, savedTimeMillis);
+            extractAndMergeMetaInf(); // استخراج وتجميع ملفات META-INF
             updateCacheAfterSuccessfulBuild(cache, currentClasspath);
             return;
         }
 
         if (dirtyFilePaths.isEmpty()) {
             classFilesChanged = false;
-            Log.d(TAG, "Incremental build: no Java files changed, skipping ECJ entirely. Saved ~"
-                    + (System.currentTimeMillis() - savedTimeMillis) + " ms");
+            extractAndMergeMetaInf(); // التأكد من استخراج وتحديث ملفات META-INF
             if (progressReceiver != null) {
                 progressReceiver.onProgress("Java is up to date (incremental build, no changes)", 13);
             }
@@ -713,7 +546,6 @@ public class ProjectBuilder {
         for (String dirtyFilePath : dirtyFilePaths) {
             deleteOldClassFiles(dirtyFilePath, cache);
         }
-        Log.d(TAG, "Incremental build: compiling " + dirtyFilePaths.size() + " changed file(s) out of " + allJavaFiles.size());
         if (progressReceiver != null) {
             progressReceiver.onProgress("Java is compiling... (incremental: " + dirtyFilePaths.size()
                     + " of " + allJavaFiles.size() + " file(s) changed)", 13);
@@ -721,13 +553,104 @@ public class ProjectBuilder {
         dirtyFilePaths.add(projectFilePaths.rJavaDirectoryPath);
         String incrementalClasspath = projectFilePaths.compiledClassesPath + ":" + currentClasspath;
         runEclipseCompiler(dirtyFilePaths, incrementalClasspath, savedTimeMillis);
+        extractAndMergeMetaInf(); // استخراج وتجميع ملفات META-INF
         updateCacheAfterSuccessfulBuild(cache, currentClasspath);
     }
 
     /**
-     * Invokes the Eclipse JDT batch compiler with the given source paths and classpath.
-     * Throws {@link SimpleException} on any compilation error.
+     * يستخرج ويدمج جميع ملفات ومجلدات META-INF (مثل services, extensions, kotlin_module)
+     * من كل ملفات JAR الموجودة في الكلاس باث إلى مجلد compiledClassesPath مع استثناء التواقيع والـ Manifest.
      */
+    public void extractAndMergeMetaInf() {
+        LogUtil.d(TAG, "Extracting and merging META-INF files from JAR libraries...");
+        List<String> jarPaths = new ArrayList<>();
+
+        // 1. جمع مكتبات JAR المضمنة (Built-In Libraries)
+        for (BuiltInLibrary library : builtInLibraryManager.getLibraries()) {
+            File jarFile = BuiltInLibraries.getLibraryClassesJarPath(library.getName());
+            if (jarFile.exists()) {
+                jarPaths.add(jarFile.getAbsolutePath());
+            }
+        }
+
+        // 2. جمع المكتبات المحلية (Local Libraries)
+        String localJars = localLibraryManager.getJarLocalLibrary();
+        if (!TextUtils.isEmpty(localJars)) {
+            for (String jarPath : localJars.split(":")) {
+                if (!jarPath.trim().isEmpty()) {
+                    jarPaths.add(jarPath.trim());
+                }
+            }
+        }
+
+        // 3. جمع ملفات JAR الخاصة بالـ Classpath المباشر للمشروع
+        String classpathDir = SketchwarePaths.getProjectClasspathPath(projectFilePaths.sc_id);
+        ArrayList<String> projectJars = FileUtil.listFiles(classpathDir, "jar");
+        if (projectJars != null) {
+            jarPaths.addAll(projectJars);
+        }
+
+        File outputClassesDir = new File(projectFilePaths.compiledClassesPath);
+
+        // 4. استخراج ودمج الملفات والمجلدات
+        for (String jarPath : jarPaths) {
+            File jarFile = new File(jarPath);
+            if (!jarFile.exists() || !jarFile.isFile()) {
+                continue;
+            }
+
+            try (ZipFile zipFile = new ZipFile(jarFile)) {
+                Enumeration<? extends ZipEntry> entries = zipFile.entries();
+                while (entries.hasMoreElements()) {
+                    ZipEntry entry = entries.nextElement();
+                    String name = entry.getName();
+
+                    // معالجة العناصر التي تبدأ بـ META-INF/
+                    if (name.startsWith("META-INF/") && !entry.isDirectory()) {
+                        String metaName = name.substring("META-INF/".length());
+
+                        // استثناء التواقيع وملف MANIFEST.MF
+                        if (isIgnoredMetaInfFile(metaName)) {
+                            continue;
+                        }
+
+                        File outputFile = new File(outputClassesDir, name);
+
+                        // إنشاء المجلدات الأبوية لملفات Services و Kotlin Modules وغيرها
+                        File parentDir = outputFile.getParentFile();
+                        if (parentDir != null && !parentDir.exists()) {
+                            parentDir.mkdirs();
+                        }
+
+                        // نسَخ أو دمج البيانات
+                        try (InputStream is = zipFile.getInputStream(entry);
+                             FileOutputStream fos = new FileOutputStream(outputFile, true)) { // Append = true لمنع حذف الإدخالات المدمجة
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            while ((bytesRead = is.read(buffer)) != -1) {
+                                fos.write(buffer, 0, bytesRead);
+                            }
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                LogUtil.e(TAG, "Failed to process META-INF from JAR: " + jarPath, e);
+            }
+        }
+    }
+
+    /**
+     * يتحقق مما إذا كان ملف META-INF حاصلاً على استثناء (تواقيع أو Manifest)
+     */
+    private boolean isIgnoredMetaInfFile(String name) {
+        String upperName = name.toUpperCase();
+        return upperName.startsWith("MANIFEST.MF")
+                || upperName.endsWith(".SF")
+                || upperName.endsWith(".DSA")
+                || upperName.endsWith(".RSA")
+                || upperName.endsWith(".EC");
+    }
+
     private void runEclipseCompiler(List<String> sourcePaths, String classpath, long startTime)
             throws SimpleException, IOException {
 
@@ -762,7 +685,6 @@ public class ProjectBuilder {
             args.add("-proc:none");
             args.addAll(sourcePaths);
 
-            /* Avoid "package ;" line in that file causing issues while compiling */
             File rJavaFileWithoutPackage = new File(projectFilePaths.rJavaDirectoryPath, "R.java");
             if (rJavaFileWithoutPackage.exists() && !rJavaFileWithoutPackage.delete()) {
                 LogUtil.w(TAG, "Failed to delete file " + rJavaFileWithoutPackage.getAbsolutePath());
@@ -835,11 +757,6 @@ public class ProjectBuilder {
         return absolutePath.equals(rootPath) || absolutePath.startsWith(rootPath + File.separator);
     }
 
-    /**
-     * Deletes all {@code .class} files associated with the given {@code .java} source file
-     * (including inner-class files like {@code Foo$1.class}) before recompiling that file,
-     * so that stale inner-class files cannot accumulate in the output directory.
-     */
     private void deleteOldClassFiles(String sourcePath, IncrementalBuildCache cache) {
         for (String classRel : getCompiledClassBasePathCandidates(sourcePath, cache)) {
             int lastSep = classRel.lastIndexOf(File.separator);
@@ -962,12 +879,6 @@ public class ProjectBuilder {
         return null;
     }
 
-    /**
-     * Assembles the unsigned, unaligned APK from compiled resources, DEX files,
-     * native libraries, and library JARs.
-     *
-     * @throws SketchwareException if APK assembly fails (e.g. duplicate files)
-     */
     public void buildApk() throws SketchwareException {
         long savedTimeMillis = System.currentTimeMillis();
         String firstDexPath = dexesToAddButNotMerge.isEmpty() ? projectFilePaths.classesDexPath : dexesToAddButNotMerge.remove(0).getAbsolutePath();
@@ -984,13 +895,11 @@ public class ProjectBuilder {
                 }
             }
 
-            /* Add project's native libraries */
             File nativeLibrariesDirectory = new File(SketchwarePaths.getProjectNativeLibsPath(projectFilePaths.sc_id));
             if (nativeLibrariesDirectory.exists()) {
                 apkBuilder.addNativeLibraries(nativeLibrariesDirectory);
             }
 
-            /* Add Local libraries' native libraries */
             for (String nativeLibraryDirectory : localLibraryManager.getNativeLibs()) {
                 apkBuilder.addNativeLibraries(new File(nativeLibraryDirectory));
             }
@@ -1028,36 +937,23 @@ public class ProjectBuilder {
                 (System.currentTimeMillis() - timestampResourceCompilationStarted) + " ms");
     }
 
-    /**
-     * Either merges DEX files to as few as possible, or adds list of DEX files to add to the APK to
-     * {@link #dexesToAddButNotMerge}.
-     * <p>
-     * Will merge DEX files if either the project's minSdkVersion is lower than 21, or if {@link BuildConfig#isDebugBuild}
-     * of {@link ProjectFilePaths#N} in {@link #ProjectFilePaths} is false.
-     *
-     * @throws Exception Thrown if merging failed
-     */
     public void getDexFilesReady() throws IOException {
         long savedTimeMillis = System.currentTimeMillis();
         ArrayList<File> dexes = new ArrayList<>();
 
-        /* Add AndroidX MultiDex library if needed */
         if (settings.getMinSdkVersion() < 21) {
             dexes.add(BuiltInLibraries.getLibraryDexFile(BuiltInLibraries.ANDROIDX_MULTIDEX));
         }
 
-        /* Add HTTP legacy files if wanted */
         if (!buildSettings.getValue(BuildSettings.SETTING_NO_HTTP_LEGACY, ProjectSettings.SETTING_GENERIC_VALUE_FALSE)
                 .equals(ProjectSettings.SETTING_GENERIC_VALUE_TRUE)) {
             dexes.add(BuiltInLibraries.getLibraryDexFile(BuiltInLibraries.HTTP_LEGACY_ANDROID));
         }
 
-        /* Add used built-in libraries' DEX files */
         for (BuiltInLibrary builtInLibrary : builtInLibraryManager.getLibraries()) {
             dexes.add(BuiltInLibraries.getLibraryDexFile(builtInLibrary.getName()));
         }
 
-        /* Add local libraries' main DEX files */
         ArrayList<HashMap<String, Object>> list = localLibraryManager.list;
         for (int localLibIdx = 0, listSize = list.size(); localLibIdx < listSize; localLibIdx++) {
             HashMap<String, Object> localLibrary = list.get(localLibIdx);
@@ -1069,7 +965,6 @@ public class ProjectBuilder {
                 if (localLibraryDexPath instanceof String) {
                     if (!proguard.libIsProguardFMEnabled((String) localLibraryName)) {
                         dexes.add(new File((String) localLibraryDexPath));
-                        /* Add library's extra DEX files */
                         File localLibraryDirectory = new File((String) localLibraryDexPath).getParentFile();
 
                         if (localLibraryDirectory != null) {
@@ -1102,7 +997,6 @@ public class ProjectBuilder {
         LogUtil.d(TAG, "Will merge these " + dexes.size() + " DEX files to classes.dex: " + dexes);
 
         if (settings.getMinSdkVersion() < 21 || !projectFilePaths.buildConfig.isDebugBuild) {
-            // Cache: skip merge if all input DEX files are unchanged
             String dexFingerprint = computeDexMergeFingerprint(dexes);
             File fingerprintFile = new File(projectFilePaths.binDirectoryPath, "dex_merge_fingerprint");
             File mergedClassesDex = new File(projectFilePaths.binDirectoryPath, "classes.dex");
@@ -1122,7 +1016,6 @@ public class ProjectBuilder {
                 }
             }
             dexLibraries(new File(projectFilePaths.binDirectoryPath), dexes);
-            // Save fingerprint after successful merge
             try {
                 java.nio.file.Files.write(fingerprintFile.toPath(), dexFingerprint.getBytes());
             } catch (IOException e) {
@@ -1135,11 +1028,6 @@ public class ProjectBuilder {
         }
     }
 
-    /**
-     * Extracts AAPT2 binaries (if they need to be extracted).
-     *
-     * @throws SketchwareException If anything goes wrong while extracting
-     */
     public void maybeExtractAapt2() throws SketchwareException {
         var abi = Build.SUPPORTED_ABIS[0];
         String assetPath = "aapt/aapt2-" + abi;
@@ -1171,12 +1059,6 @@ public class ProjectBuilder {
         }
     }
 
-    /**
-     * Populates the built-in library manager based on project configuration flags
-     * (AppCompat, Firebase, Maps, AdMob, Gson, Glide, OkHttp, Kotlin, etc.).
-     * This must be called before compilation so that the classpath includes
-     * all required library JARs.
-     */
     public void buildBuiltInLibraryInformation() {
         if (projectFilePaths.buildConfig.isAppCompatEnabled) {
             builtInLibraryManager.addLibrary(BuiltInLibraries.ANDROIDX_APPCOMPAT);
@@ -1212,34 +1094,19 @@ public class ProjectBuilder {
         }
 
         KotlinCompilerBridge.maybeAddKotlinBuiltInLibraryDependenciesIfPossible(this, builtInLibraryManager);
-
         ExtLibSelected.addUsedDependencies(projectFilePaths.buildConfig.constVarComponent, builtInLibraryManager);
     }
 
-    /**
-     * Returns the built-in library manager used for this build.
-     *
-     * @return the built-in library manager instance
-     */
     public BuiltInLibraryManager getBuiltInLibraryManager() {
         return builtInLibraryManager;
     }
 
-    /**
-     * Sign the debug APK file with testkey.
-     * <p>
-     * This method uses apksigner, but kellinwood's zipsigner as fallback.
-     */
     public void signDebugApk() throws GeneralSecurityException, IOException, ClassNotFoundException, IllegalAccessException, InstantiationException {
         long savedTimeMillis = System.currentTimeMillis();
         TestkeySignBridge.signWithTestkey(projectFilePaths.unsignedUnalignedApkPath, projectFilePaths.finalToInstallApkPath);
         Log.d(TAG, "Signing debug APK took " + (System.currentTimeMillis() - savedTimeMillis) + " ms");
     }
 
-    /**
-     * Computes a fingerprint of all input DEX files for merge caching.
-     * Uses path + size + lastModified to detect changes.
-     */
     private String computeDexMergeFingerprint(List<File> dexFiles) {
         StringBuilder sb = new StringBuilder(dexFiles.size() * 64);
         for (File f : dexFiles) {
@@ -1255,11 +1122,6 @@ public class ProjectBuilder {
         merger.merge().writeTo(target);
     }
 
-    /**
-     * Adds all built-in libraries' ProGuard rules to {@code args}, if any.
-     *
-     * @param args List of arguments to add built-in libraries' ProGuard roles to.
-     */
     private void proguardAddLibConfigs(List<String> args) {
         for (BuiltInLibrary library : builtInLibraryManager.getLibraries()) {
             File config = BuiltInLibraries.getLibraryProguardConfiguration(library.getName());
@@ -1270,11 +1132,6 @@ public class ProjectBuilder {
         }
     }
 
-    /**
-     * Generates default ProGuard R.java rules and adds them to {@code args}.
-     *
-     * @param args List of arguments to add R.java rules to.
-     */
     private void proguardAddRjavaRules(List<String> args) {
         FileUtil.writeFile(projectFilePaths.proguardAutoGeneratedExclusions, getRJavaRules());
         args.add("-include");
@@ -1305,14 +1162,6 @@ public class ProjectBuilder {
         return sb.toString();
     }
 
-    /**
-     * Runs R8 compiler for code shrinking and optimization.
-     * Packages compiled classes into a JAR, applies ProGuard rules from
-     * built-in libraries, local libraries, and user configuration,
-     * then invokes R8 with the project's min SDK version.
-     *
-     * @throws IOException if R8 compilation fails
-     */
     public void runR8() throws IOException {
         long savedTimeMillis = System.currentTimeMillis();
 
@@ -1346,41 +1195,25 @@ public class ProjectBuilder {
         LogUtil.d(TAG, "R8 took " + (System.currentTimeMillis() - savedTimeMillis) + " ms");
     }
 
-    /**
-     * Runs ProGuard for code shrinking and obfuscation.
-     * Applies global rules, AAPT2-generated rules, user custom rules,
-     * built-in library rules, and local library rules.
-     * Optionally generates seeds, usage, and mapping debug files.
-     *
-     * @throws IOException if ProGuard execution fails
-     */
     public void runProguard() throws IOException {
         long savedTimeMillis = System.currentTimeMillis();
 
         ArrayList<String> args = new ArrayList<>();
-
-        /* Include global ProGuard rules */
         args.add("-include");
         args.add(ProguardHandler.ANDROID_PROGUARD_RULES_PATH);
-
-        /* Include ProGuard rules generated by AAPT2 */
         args.add("-include");
         args.add(projectFilePaths.proguardAaptRules);
-
-        /* Include custom ProGuard rules */
         args.add("-include");
         args.add(proguard.getCustomProguardRules());
 
         proguardAddLibConfigs(args);
         proguardAddRjavaRules(args);
 
-        /* Include local libraries' ProGuard rules */
         for (String rule : localLibraryManager.getPgRules()) {
             args.add("-include");
             args.add(rule);
         }
 
-        /* ProGuard -injars accepts both JAR files and directories of .class files */
         args.add("-injars");
         args.add(projectFilePaths.compiledClassesPath);
 
@@ -1403,7 +1236,6 @@ public class ProjectBuilder {
             args.add("-printmapping");
             args.add(projectFilePaths.proguardMappingPath);
         }
-        LogUtil.d(TAG, "About to run ProGuard with these arguments: " + args);
 
         Configuration configuration = new Configuration();
 
@@ -1427,11 +1259,6 @@ public class ProjectBuilder {
         LogUtil.d(TAG, "ProGuard took " + (System.currentTimeMillis() - savedTimeMillis) + " ms");
     }
 
-    /**
-     * Runs StringFog string encryption on compiled class files.
-     * Injects the StringFog runtime classes and encrypts string constants
-     * using XOR-based obfuscation. Generates a mapping file for debugging.
-     */
     public void runStringfog() {
         try {
             StringFogMappingPrinter stringFogMappingPrinter = new StringFogMappingPrinter(new File(projectFilePaths.binDirectoryPath,
@@ -1450,13 +1277,6 @@ public class ProjectBuilder {
         }
     }
 
-    /**
-     * Runs zipalign on an APK to ensure 4-byte alignment of uncompressed data.
-     *
-     * @param inPath  path to the input (unaligned) APK
-     * @param outPath path to write the aligned APK
-     * @throws SketchwareException if zipalign fails
-     */
     public void runZipalign(String inPath, String outPath) throws SketchwareException {
         LogUtil.d(TAG, "About to zipalign " + inPath + " to " + outPath);
         long savedTimeMillis = System.currentTimeMillis();
@@ -1473,11 +1293,6 @@ public class ProjectBuilder {
         LogUtil.d(TAG, "zipalign took " + (System.currentTimeMillis() - savedTimeMillis) + " ms");
     }
 
-    /**
-     * Sets whether to build an Android App Bundle (AAB) instead of an APK.
-     *
-     * @param buildAppBundle {@code true} to produce AAB output
-     */
     public void setBuildAppBundle(boolean buildAppBundle) {
         this.buildAppBundle = buildAppBundle;
     }
